@@ -15,8 +15,8 @@ check_container_ip() {
 
 if [ $# -eq 0 ]; then
     echo "Usage: $0 <container> [container...]"
-    echo "Example: $0 slskd"
-    echo "         $0 qbittorrent slskd"
+    echo "Example: $0 netbird"
+    echo "         $0 netbird n8n"
     exit 1
 fi
 
