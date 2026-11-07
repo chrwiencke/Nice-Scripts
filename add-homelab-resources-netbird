@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+#
+# add-homelab-resources.sh — add domain resources to a NetBird network.
+#
+# Takes a list of domains (as arguments or from a file) and creates a
+# network resource for each in the target network (default: "HomeLab").
+# Resources are assigned to an ACL group (default: "homelab-apps"),
+# which is created automatically if it does not exist.
+#
+# Idempotent: domains that already exist as resources are skipped.
+#
+# Usage:
+#   ./add-homelab-resources.sh app1.bunkrd.net app2.bunkrd.net app3.bunkrd.net
+#   ./add-homelab-resources.sh -f domains.txt
+#   cat domains.txt | ./add-homelab-resources.sh -
+#
+# Configuration (env vars):
+#   NETBIRD_TOKEN    Personal Access Token (required).
+#                    Dashboard -> Profile -> Personal Access Tokens -> Create
+#   NETBIRD_API      API base URL (default: https://api.netbird.io/api)
+#                    Set to your own host for self-hosted, e.g.
+#                    https://netbird.example.com/api
+#   NETBIRD_NETWORK  Network name (default: HomeLab)
+#   NETBIRD_GROUP    ACL group for the resources (default: homelab-apps)
+#                    Your access policy must allow this group for the
+#                    resources to be reachable.
+#
+# Requires: bash, curl, jq
+
+set -euo pipefail
+
+NETBIRD_API="${NETBIRD_API:-https://api.netbird.io/api}"
+NETBIRD_NETWORK="${NETBIRD_NETWORK:-HomeLab}"
+NETBIRD_GROUP="${NETBIRD_GROUP:-homelab-apps}"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+[[ -n "${NETBIRD_TOKEN:-}" ]] || die "NETBIRD_TOKEN is not set. Create a Personal Access Token in the NetBird dashboard."
+command -v curl >/dev/null 2>&1 || die "curl is required"
+command -v jq >/dev/null 2>&1 || die "jq is required"
+
+# ---------- collect domains ----------
+DOMAINS=()
+FILE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -f|--file) FILE="$2"; shift 2 ;;
+    -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) DOMAINS+=("$1"); shift ;;
+  esac
+done
+
+if [[ -n "$FILE" ]]; then
+  [[ -r "$FILE" ]] || die "Cannot read file: $FILE"
+  while IFS= read -r line; do
+    line="${line%%#*}"                      # strip comments
+    line="$(echo "$line" | xargs)"          # trim whitespace
+    [[ -n "$line" ]] && DOMAINS+=("$line")
+  done < "$FILE"
+elif [[ ! -t 0 && ${#DOMAINS[@]} -eq 0 ]]; then
+  while IFS= read -r line; do
+    line="$(echo "$line" | xargs)"
+    [[ -n "$line" ]] && DOMAINS+=("$line")
+  done
+fi
+
+[[ ${#DOMAINS[@]} -gt 0 ]] || die "No domains given. Pass domains as arguments or use -f <file>."
+
+# ---------- API helpers ----------
+api() {
+  # api METHOD PATH [JSON_BODY]
+  local method="$1" path="$2" body="${3:-}"
+  local args=(-sS -X "$method"
+    -H "Accept: application/json"
+    -H "Authorization: Token ${NETBIRD_TOKEN}"
+    -w '\n%{http_code}')
+  [[ -n "$body" ]] && args+=(-H "Content-Type: application/json" -d "$body")
+  curl "${args[@]}" "${NETBIRD_API}${path}"
+}
+
+api_json() {
+  # api_json METHOD PATH [JSON_BODY] -> body on stdout, fails on HTTP != 2xx
+  local raw status body
+  raw="$(api "$@")"
+  status="$(echo "$raw" | tail -n1)"
+  body="$(echo "$raw" | sed '$d')"
+  if [[ ! "$status" =~ ^2 ]]; then
+    echo "HTTP $status: $body" >&2
+    return 1
+  fi
+  echo "$body"
+}
+
+# ---------- resolve network id by name ----------
+NETWORKS_JSON="$(api_json GET /networks)" || die "Could not list networks. Check NETBIRD_TOKEN / NETBIRD_API."
+NETWORK_ID="$(echo "$NETWORKS_JSON" | jq -r --arg name "$NETBIRD_NETWORK" '.[] | select(.name == $name) | .id' | head -n1)"
+[[ -n "$NETWORK_ID" ]] || die "Network \"$NETBIRD_NETWORK\" not found. Existing: $(echo "$NETWORKS_JSON" | jq -r '.[].name' | paste -sd, -)"
+
+# ---------- resolve or create the ACL group ----------
+GROUPS_JSON="$(api_json GET /groups)" || die "Could not list groups."
+GROUP_ID="$(echo "$GROUPS_JSON" | jq -r --arg name "$NETBIRD_GROUP" '.[] | select(.name == $name) | .id' | head -n1)"
+if [[ -z "$GROUP_ID" ]]; then
+  echo "Group \"$NETBIRD_GROUP\" not found — creating it."
+  GROUP_ID="$(api_json POST /groups "{\"name\": \"$NETBIRD_GROUP\"}" | jq -r '.id')" || die "Could not create group."
+  echo "  created group $GROUP_ID"
+fi
+
+# ---------- existing resources (for idempotency) ----------
+EXISTING_JSON="$(api_json GET "/networks/${NETWORK_ID}/resources")" || die "Could not list resources."
+EXISTING="$(echo "$EXISTING_JSON" | jq -r '.[].address')"
+
+echo "Network: $NETBIRD_NETWORK ($NETWORK_ID)"
+echo "Group:   $NETBIRD_GROUP ($GROUP_ID)"
+echo "Adding ${#DOMAINS[@]} domain resource(s)..."
+echo
+
+ADDED=0; SKIPPED=0; FAILED=0
+for domain in "${DOMAINS[@]}"; do
+  # basic domain validation
+  if ! [[ "$domain" =~ ^([*a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$ ]]; then
+    echo "  SKIP  $domain (invalid domain format)"
+    ((FAILED++)) || true
+    continue
+  fi
+
+  if echo "$EXISTING" | grep -qxF "$domain"; then
+    echo "  SKIP  $domain (already a resource)"
+    ((SKIPPED++)) || true
+    continue
+  fi
+
+  BODY="$(jq -n --arg name "$domain" --arg addr "$domain" --arg gid "$GROUP_ID" \
+    '{name: $name, address: $addr, enabled: true, groups: [$gid]}')"
+  if api_json POST "/networks/${NETWORK_ID}/resources" "$BODY" >/dev/null; then
+    echo "  ADD   $domain"
+    EXISTING+="$domain"$'\n'
+    ((ADDED++)) || true
+  else
+    echo "  FAIL  $domain"
+    ((FAILED++)) || true
+  fi
+done
+
+echo
+echo "Done: $ADDED added, $SKIPPED skipped (already present), $FAILED failed."
+echo "Reminder: peers only reach these resources if an access policy allows"
+echo "them -> the \"$NETBIRD_GROUP\" group."
+[[ $FAILED -eq 0 ]] || exit 1
